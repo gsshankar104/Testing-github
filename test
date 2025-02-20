@@ -1,0 +1,198 @@
+import logging
+import random
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+
+# Enable logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# States
+AWAITING_PAYMENT = 1
+AWAITING_NUMBER = 2
+
+# Bot Configuration
+TOKEN = "7537227589:AAE3N3WcTQMVAHeFp12sYE4oYd8-gsYR7K8"
+ADMIN_ID = 6411979496
+GROUP_CHAT_ID = -1001982498975
+ADMIN_USERNAME = "gsshankar104"
+
+# Initialize data storage
+user_data = {}
+valid_transactions = set()
+used_transactions = set()
+
+def get_current_time():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("10 Rs", callback_data='10')],
+        [InlineKeyboardButton("99 Rs", callback_data='99')],
+        [InlineKeyboardButton("199 Rs", callback_data='199')],
+        [InlineKeyboardButton("299 Rs", callback_data='299')],
+        [InlineKeyboardButton("999 Rs", callback_data='999')],
+        [InlineKeyboardButton("2999 Rs", callback_data='2999')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Please select ticket price:', reply_markup=reply_markup)
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_data[user_id] = {'ticket_price': query.data, 'time': get_current_time()}
+    
+    await query.edit_message_text(
+        text=f"Selected amount: {query.data} Rs\nPlease send your Transaction ID"
+    )
+    return AWAITING_PAYMENT
+
+async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    transaction_id = update.message.text.strip()
+    
+    if len(transaction_id) != 12 or not transaction_id.isdigit():
+        await update.message.reply_text("Please send a valid 12-digit transaction ID.")
+        return AWAITING_PAYMENT
+        
+    if transaction_id in used_transactions:
+        await update.message.reply_text("This Transaction ID has already been used!")
+        return AWAITING_PAYMENT
+        
+    if transaction_id not in valid_transactions:
+        await update.message.reply_text("Transaction ID not found. Please check and try again.")
+        return AWAITING_PAYMENT
+    
+    # Valid transaction ID
+    used_transactions.add(transaction_id)
+    valid_transactions.remove(transaction_id)
+    user_data[user_id]['transaction_id'] = transaction_id
+    
+    await update.message.reply_text("Transaction verified! Please select a number between 1-100.")
+    return AWAITING_NUMBER
+
+async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        number = int(update.message.text)
+        if not 1 <= number <= 100:
+            await update.message.reply_text("Please select a number between 1-100.")
+            return AWAITING_NUMBER
+            
+        user_id = update.message.from_user.id
+        user_data[user_id]['number'] = number
+        user_data[user_id]['code'] = f"{random.randint(100000, 999999)}-{user_id}"
+        
+        # Send confirmation to user
+        await update.message.reply_text(
+            f"✅ Entry Confirmed!\n\n"
+            f"🎫 Ticket Price: {user_data[user_id]['ticket_price']} Rs\n"
+            f"🔢 Your Number: {number}\n"
+            f"🆔 Your Code: {user_data[user_id]['code']}\n"
+            f"⏰ Time: {get_current_time()}"
+        )
+        
+        # Notify admin
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"New Entry!\n\n"
+                 f"User ID: {user_id}\n"
+                 f"Price: {user_data[user_id]['ticket_price']} Rs\n"
+                 f"Number: {number}\n"
+                 f"Code: {user_data[user_id]['code']}\n"
+                 f"Transaction: {user_data[user_id]['transaction_id']}\n"
+                 f"Time: {get_current_time()}"
+        )
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("Please send a valid number between 1-100.")
+        return AWAITING_NUMBER
+
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat.id != GROUP_CHAT_ID:
+        return
+        
+    message = update.message.text
+    if "AD-AIRBNK" in message and "Txn ID:" in message:
+        # Extract transaction ID using regex
+        import re
+        match = re.search(r"Txn ID: (\d{12})", message)
+        if match:
+            txn_id = match.group(1)
+            if txn_id not in used_transactions:
+                valid_transactions.add(txn_id)
+                logger.info(f"New transaction ID added: {txn_id}")
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+        
+    if not context.args:
+        await update.message.reply_text("Available commands:\n/admin stats\n/admin winners <count>")
+        return
+        
+    command = context.args[0]
+    
+    if command == "stats":
+        stats = (
+            f"📊 Statistics\n\n"
+            f"Total Users: {len(user_data)}\n"
+            f"Valid Transactions: {len(valid_transactions)}\n"
+            f"Used Transactions: {len(used_transactions)}\n"
+            f"Time: {get_current_time()}"
+        )
+        await update.message.reply_text(stats)
+        
+    elif command == "winners" and len(context.args) > 1:
+        try:
+            count = int(context.args[1])
+            eligible_users = [uid for uid, data in user_data.items() if 'number' in data]
+            
+            if not eligible_users:
+                await update.message.reply_text("No eligible participants!")
+                return
+                
+            winners = random.sample(eligible_users, min(count, len(eligible_users)))
+            
+            announcement = "🎉 Winners 🎉\n\n"
+            for i, winner_id in enumerate(winners, 1):
+                announcement += (
+                    f"Winner #{i}:\n"
+                    f"Code: {user_data[winner_id]['code']}\n"
+                    f"Number: {user_data[winner_id]['number']}\n"
+                    f"Amount: {user_data[winner_id]['ticket_price']} Rs\n\n"
+                )
+            
+            await update.message.reply_text(announcement)
+            
+        except ValueError:
+            await update.message.reply_text("Please specify a valid number of winners")
+
+def main():
+    application = Application.builder().token(TOKEN).build()
+    
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(button)
+        ],
+        states={
+            AWAITING_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payment)],
+            AWAITING_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number)],
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+    
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Chat(GROUP_CHAT_ID), handle_group_message))
+    
+    print(f"Bot started at {get_current_time()}")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
